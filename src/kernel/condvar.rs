@@ -1,6 +1,6 @@
 use crate::{proc, spinlock::MutexGuard};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Condvar;
 
 impl Condvar {

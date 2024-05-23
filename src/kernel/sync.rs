@@ -21,6 +21,12 @@ struct OnceLockGuard<'a, T> {
     poison: bool,
 }
 
+impl<T> Default for OnceLock<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> OnceLock<T> {
     pub const fn new() -> Self {
         Self {

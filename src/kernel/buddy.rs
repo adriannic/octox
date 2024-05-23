@@ -65,6 +65,12 @@ impl Array for Option<NonNull<[u8]>> {
     }
 }
 
+impl Default for BuddyAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BuddyAllocator {
     // The smallest block size
     const LEAF_SIZE: usize = 16;

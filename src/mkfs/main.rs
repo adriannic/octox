@@ -89,10 +89,11 @@ impl FsImg {
     fn ialloc(&mut self, itype: FileType) -> Result<u32, std::io::Error> {
         let inum = self.freeinode as u32;
         self.freeinode += 1;
-        let mut din: DInode = Default::default();
-        din.itype = (itype as u16).to_le();
-        din.nlink = 1u16.to_le();
-        din.size = 0;
+        let din = DInode {
+            itype: (itype as u16).to_le(),
+            nlink: 1u16.to_le(),
+            ..Default::default()
+        };
         self.winode(inum, &din)?;
         Ok(inum)
     }
@@ -109,7 +110,7 @@ impl FsImg {
         //}
         for i in 0..used {
             if let Some(elem) = buf.get_mut(i / 8) {
-                *elem = *elem | (0x1 << (i % 8));
+                *elem |= 0x1 << (i % 8);
             }
         }
         println!(
@@ -251,21 +252,22 @@ fn main() -> std::io::Result<()> {
     let rootino = fsimg.ialloc(FileType::Dir)?;
     assert!(rootino == ROOTINO);
 
-    let mut de: DirEnt = Default::default();
-    de.inum = (rootino as u16).to_le();
+    let mut de = DirEnt {
+        inum: (rootino as u16).to_le(),
+        ..Default::default()
+    };
+
     de.name[..".".len()].copy_from_slice(".".as_bytes());
     fsimg.iappend(rootino, mkfs_as_bytes(&de))?;
 
-    let mut de: DirEnt = Default::default();
-    de.inum = (rootino as u16).to_le();
+    let mut de = DirEnt {
+        inum: (rootino as u16).to_le(),
+        ..Default::default()
+    };
     de.name[.."..".len()].copy_from_slice("..".as_bytes());
     fsimg.iappend(rootino, mkfs_as_bytes(&de))?;
 
-    for path in args[2..]
-        .iter()
-        .map(|p| Path::new(p))
-        .filter(|p| p.exists())
-    {
+    for path in args[2..].iter().map(Path::new).filter(|p| p.exists()) {
         // Skip leading _ in name when writing to file system.
         // The binaries are named _rm, _cat, etc. to keep the
         // build operating system from trying to execute them
@@ -282,8 +284,10 @@ fn main() -> std::io::Result<()> {
 
         let inum = fsimg.ialloc(FileType::File)?;
 
-        let mut de: DirEnt = Default::default();
-        de.inum = (inum as u16).to_le();
+        let mut de = DirEnt {
+            inum: (inum as u16).to_le(),
+            ..Default::default()
+        };
         de.name[..shortname.len()].copy_from_slice(shortname.as_bytes());
         fsimg.iappend(rootino, mkfs_as_bytes(&de))?;
 

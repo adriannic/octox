@@ -129,12 +129,12 @@ pub struct IntrLock;
 
 impl Drop for IntrLock {
     fn drop(&mut self) {
-        unsafe { (&mut *CPUS.mycpu()).unlock() }
+        unsafe { (*CPUS.mycpu()).unlock() }
     }
 }
 
 // Saved registers for kernel context switches.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct Context {
     pub ra: usize,
@@ -227,7 +227,7 @@ pub struct Proc {
 unsafe impl Sync for Proc {}
 
 // lock must be held when uding these:
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ProcInner {
     pub state: ProcState, // Process state
     pub chan: usize,      // if non-zero, sleeping on chan
@@ -251,8 +251,9 @@ pub struct ProcData {
 unsafe impl Sync for ProcData {}
 unsafe impl Send for ProcData {}
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+#[derive(PartialEq, Clone, Copy, Debug, Default)]
 pub enum ProcState {
+    #[default]
     UNUSED,
     USED,
     SLEEPING,
@@ -261,7 +262,7 @@ pub enum ProcState {
     ZOMBIE,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct PId(usize);
 
 impl PId {
@@ -524,7 +525,7 @@ pub fn user_init(initcode: &'static [u8]) {
     unsafe {
         let (head, body, _) = initcode[0..size_of::<ElfHdr>()].align_to::<ElfHdr>();
         assert!(head.is_empty(), "elf_img is not aligned");
-        elf = body.get(0).unwrap();
+        elf = body.first().unwrap();
     }
     if elf.e_ident[elf::EI_MAG0] != elf::ELFMAG0
         || elf.e_ident[elf::EI_MAG1] != elf::ELFMAG1
@@ -541,7 +542,7 @@ pub fn user_init(initcode: &'static [u8]) {
         unsafe {
             let (head, body, _) = initcode[off..(off + size_of::<ProgHdr>())].align_to::<ProgHdr>();
             assert!(head.is_empty(), "elf prong header is not aligned");
-            phdr = *body.get(0).unwrap();
+            phdr = *body.first().unwrap();
         }
         if phdr.p_type != elf::PT_LOAD || phdr.p_fsize == 0 {
             continue;

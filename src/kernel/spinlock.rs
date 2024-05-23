@@ -77,7 +77,7 @@ impl<T> Mutex<T> {
     pub unsafe fn force_unlock(&self) {
         assert!(self.holding(), "force unlock {}", self.name);
         self.locked.store(ptr::null_mut(), Ordering::Release);
-        (&mut *CPUS.mycpu()).unlock()
+        (*CPUS.mycpu()).unlock()
     }
 }
 
