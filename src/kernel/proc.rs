@@ -69,13 +69,30 @@ impl Cpus {
     }
 
     // Return the current proc pointer: Some(Arc<Proc>), or None if none.
-    pub fn myproc() -> Option<Arc<Proc>> {
+    pub fn mythread() -> Option<Arc<Proc>> {
         let _intr_lock = Self::lock_mycpu("withoutspin");
         let c;
         unsafe {
             c = &*CPUS.mycpu();
         }
         c.proc.clone()
+    }
+
+    // Return the current process.
+    pub fn myproc() -> Arc<Proc> {
+        let pid;
+        {
+            let t = Cpus::mythread().expect("Thread should exist");
+            let inner = t.inner.lock();
+            pid = inner.pid;
+        }
+        for p in PROCS.pool.iter() {
+            let inner = p.inner.lock();
+            if inner.tid == pid {
+                return Arc::clone(p);
+            }
+        }
+        panic!("Process not found");
     }
 
     // disable interrupts on mycpu().
@@ -234,6 +251,7 @@ pub struct ProcInner {
     pub killed: bool,     // if true, have been killed
     pub xstate: i32,      // Exit status to be returned to parent's wait
     pub pid: PId,         // Process ID
+    pub tid: PId,         // Thread ID
 }
 
 // These are private to the process, so lock need not be held.
@@ -362,6 +380,7 @@ impl Procs {
             match lock.state {
                 ProcState::UNUSED => {
                     lock.pid = PId::alloc();
+                    lock.tid = lock.pid;
                     lock.state = ProcState::USED;
 
                     let data = p.data_mut();
@@ -417,6 +436,11 @@ impl Proc {
         self.inner.lock().pid.0
     }
 
+    pub fn is_proc(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.pid == inner.tid
+    }
+
     pub fn data(&self) -> &'static ProcData {
         unsafe { &*(self.data.get()) }
     }
@@ -433,6 +457,7 @@ impl Proc {
         }
         data.sz = 0;
         guard.pid = PId(0);
+        guard.tid = PId(0);
         data.name.clear();
         guard.chan = 0;
         guard.killed = false;
@@ -481,7 +506,7 @@ impl Proc {
 pub fn either_copyout<T: ?Sized + AsBytes>(dst: VirtAddr, src: &T) -> Result<()> {
     match dst {
         VirtAddr::User(addr) => {
-            let p = Cpus::myproc().unwrap();
+            let p = Cpus::mythread().unwrap();
             let uvm = p.data_mut().uvm.as_mut().unwrap();
             uvm.copyout(addr.into(), src)
         }
@@ -499,7 +524,7 @@ pub fn either_copyout<T: ?Sized + AsBytes>(dst: VirtAddr, src: &T) -> Result<()>
 pub fn either_copyin<T: ?Sized + AsBytes>(dst: &mut T, src: VirtAddr) -> Result<()> {
     match src {
         VirtAddr::User(addr) => {
-            let p = Cpus::myproc().unwrap();
+            let p = Cpus::mythread().unwrap();
             let uvm = p.data_mut().uvm.as_mut().unwrap();
             uvm.copyin(dst, addr.into())
         }
@@ -589,6 +614,7 @@ impl ProcInner {
             killed: false,
             xstate: 0,
             pid: PId(0),
+            tid: PId(0),
         }
     }
 }
@@ -621,7 +647,7 @@ pub unsafe extern "C" fn fork_ret() -> ! {
 
     // still holding "proc" lock from scheduler.
     // force_unlock() from my_proc() is needed because the stack is different
-    Cpus::myproc().unwrap().inner.force_unlock();
+    Cpus::mythread().unwrap().inner.force_unlock();
 
     if FIRST {
         // File system initialization must be run in the context of a
@@ -645,8 +671,8 @@ pub fn dump() {
         let data = unsafe { &(*proc.data.get()) };
         if inner.state != ProcState::UNUSED {
             println!(
-                "pid: {:?} state: {:?} name: {:?}, chan: {}",
-                inner.pid, inner.state, data.name, inner.chan
+                "tid: {:?} state: {:?} name: {:?}, chan: {}",
+                inner.tid, inner.state, data.name, inner.chan
             );
         }
     }
@@ -716,18 +742,19 @@ fn sched<'a>(guard: MutexGuard<'a, ProcInner>, ctx: &mut Context) -> MutexGuard<
 
 // Give up the CPU for one scheduling round.
 pub fn yielding() {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let mut guard = p.inner.lock();
     guard.state = ProcState::RUNNABLE;
     sched(guard, &mut p.data_mut().context);
 }
 
 pub fn exit(status: i32) -> ! {
-    let p = Cpus::myproc().unwrap();
-    assert!(!Arc::ptr_eq(&p, INITPROC.get().unwrap()), "init exiting");
+    let t = Cpus::mythread().unwrap();
+    let pid = t.inner.lock().pid;
+    assert!(!Arc::ptr_eq(&t, INITPROC.get().unwrap()), "init exiting");
 
     // Close all open files
-    let data = p.data_mut();
+    let data = t.data_mut();
     for fd in data.ofile.iter_mut() {
         let _file = fd.take();
     }
@@ -738,13 +765,25 @@ pub fn exit(status: i32) -> ! {
     }
     LOG.end_op();
 
+    if t.is_proc() {
+        for thread in PROCS.pool.iter() {
+            let mut inner = thread.inner.lock();
+            if inner.pid == pid && inner.tid != pid {
+                inner.killed = true;
+                if inner.state == ProcState::SLEEPING {
+                    inner.state = ProcState::RUNNABLE;
+                }
+            }
+        }
+    }
+
     let mut proc_guard;
     {
         let mut parents = PROCS.parents.lock();
         // Pass p's abandoned children to init.
         for opp in parents.iter_mut().filter(|pp| pp.is_some()) {
             match opp {
-                Some(ref pp) if Arc::ptr_eq(pp, &p) => {
+                Some(ref pp) if Arc::ptr_eq(pp, &t) => {
                     let initproc = INITPROC.get().unwrap();
                     opp.replace(Arc::clone(initproc));
                     self::wakeup(Arc::as_ptr(initproc) as usize);
@@ -753,8 +792,8 @@ pub fn exit(status: i32) -> ! {
             }
         }
         // Parent might be sleeping in wait().
-        self::wakeup(Arc::as_ptr(parents[p.idx].as_ref().unwrap()) as usize);
-        proc_guard = p.inner.lock();
+        self::wakeup(Arc::as_ptr(parents[t.idx].as_ref().unwrap()) as usize);
+        proc_guard = t.inner.lock();
         proc_guard.xstate = status;
         proc_guard.state = ProcState::ZOMBIE;
     }
@@ -776,7 +815,7 @@ pub fn sleep<T>(chan: usize, mutex_guard: MutexGuard<'_, T>) -> MutexGuard<'_, T
     // so it's okay to release lock of mutex_guard.
     let mutex;
     {
-        let p = Cpus::myproc().unwrap();
+        let p = Cpus::mythread().unwrap();
         let mut proc_lock = p.inner.lock();
         mutex = Mutex::unlock(mutex_guard);
 
@@ -797,7 +836,7 @@ pub fn sleep<T>(chan: usize, mutex_guard: MutexGuard<'_, T>) -> MutexGuard<'_, T
 // Must be called without any "proc" lock.
 pub fn wakeup(chan: usize) {
     for p in PROCS.pool.iter() {
-        match Cpus::myproc() {
+        match Cpus::mythread() {
             Some(ref cp) if Arc::ptr_eq(p, cp) => (),
             _ => {
                 let mut guard = p.inner.lock();
@@ -812,7 +851,7 @@ pub fn wakeup(chan: usize) {
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 pub fn fork() -> Result<usize> {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let p_data = p.data_mut();
     let (c, c_guard) = PROCS.alloc()?;
     let c_data = c.data_mut();
@@ -852,10 +891,98 @@ pub fn fork() -> Result<usize> {
     Ok(pid.0)
 }
 
+// Create a new thread, copying the parent.
+// Child starts execution by calling the function passed.
+pub fn clone() -> Result<usize> {
+    let p = Cpus::mythread().unwrap();
+    let p_data = p.data_mut();
+    let (c, mut c_guard) = PROCS.alloc()?;
+    let c_data = c.data_mut();
+
+    // Copy user memory from parent to child.
+    let p_uvm = p_data.uvm.as_mut().unwrap();
+    let c_uvm = c_data.uvm.as_mut().unwrap();
+    if let Err(err) = p_uvm.copy(c_uvm, p_data.sz) {
+        c.free(c_guard);
+        return Err(err);
+    }
+    c_data.sz = p_data.sz;
+    c_guard.pid = p.inner.lock().pid;
+
+    // copy saved user registers
+    let p_tf = p_data.trapframe.as_ref().unwrap();
+    let c_tf = c_data.trapframe.as_mut().unwrap();
+    c_tf.clone_from(p_tf);
+
+    // Cause fork to return 0 in the child.
+    c_tf.a0 = 0;
+
+    // increment reference counts on open file descriptors.
+    c_data.ofile.clone_from_slice(&p_data.ofile);
+    c_data.cwd = p_data.cwd.clone();
+
+    c_data.name.push_str(&p_data.name);
+
+    let tid = c_guard.tid;
+
+    let c_inner = Mutex::unlock(c_guard);
+    {
+        let mut parents = PROCS.parents.lock();
+        parents[c.idx] = Some(Arc::clone(&p));
+    }
+    c_inner.lock().state = ProcState::RUNNABLE;
+
+    Ok(tid.0)
+}
+
+// Wait for a child thread to exit and return its tid.
+// Return Err, if this process has no children.
+pub fn join(tid: usize, addr: UVAddr) -> Result<usize> {
+    let mut threadfound;
+    let t = Cpus::mythread().unwrap();
+    let tid = PId(tid);
+
+    let mut parents = PROCS.parents.lock();
+
+    loop {
+        // Scan through table looking for exited children.
+        threadfound = false;
+        for c in PROCS.pool.iter() {
+            let c_guard = c.inner.lock();
+            match parents[c.idx] {
+                Some(_) if c_guard.tid == tid => {
+                    // make sure the child isn't still in exit() or swtch().
+                    threadfound = true;
+                    if c_guard.state == ProcState::ZOMBIE {
+                        // Found one.
+                        t.data_mut()
+                            .uvm
+                            .as_mut()
+                            .unwrap()
+                            .copyout(addr, &c_guard.xstate)?;
+                        c.free(c_guard);
+                        parents[c.idx].take();
+                        return Ok(tid.0);
+                    }
+                }
+                _ => continue,
+            }
+        }
+        // No point waiting if we don't have any children.
+        if !threadfound || t.inner.lock().killed {
+            break Err(NoChildProcesses);
+        }
+
+        // wait for a child to exit
+        parents = sleep(Arc::as_ptr(&t) as usize, parents);
+    }
+}
+
 // Kill the process with the given pid.
 // The victim won't exit until it tries to return
 // to user space (see usertrap in trap.rs)
 pub fn kill(pid: usize) -> Result<()> {
+    let mut killed = false;
     for p in PROCS.pool.iter() {
         let mut guard = p.inner.lock();
         if guard.pid.0 == pid {
@@ -864,10 +991,14 @@ pub fn kill(pid: usize) -> Result<()> {
                 // Wake process from sleep().
                 guard.state = ProcState::RUNNABLE;
             }
-            return Ok(());
+            killed = true;
         }
     }
-    Err(NoSuchProcess)
+    if killed {
+        Ok(())
+    } else {
+        Err(NoSuchProcess)
+    }
 }
 
 // Wait for a child process to exit and return its pid.
@@ -875,7 +1006,7 @@ pub fn kill(pid: usize) -> Result<()> {
 pub fn wait(addr: UVAddr) -> Result<usize> {
     let pid;
     let mut havekids;
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::myproc();
 
     let mut parents = PROCS.parents.lock();
 
@@ -884,7 +1015,7 @@ pub fn wait(addr: UVAddr) -> Result<usize> {
         havekids = false;
         for c in PROCS.pool.iter() {
             match parents[c.idx] {
-                Some(ref pp) if Arc::ptr_eq(pp, &p) => {
+                Some(ref pp) if Arc::ptr_eq(pp, &p) && c.is_proc() => {
                     // macke sure the child isn't still in exit() or swtch().
                     let c_guard = c.inner.lock();
                     havekids = true;
@@ -916,7 +1047,7 @@ pub fn wait(addr: UVAddr) -> Result<usize> {
 
 pub fn grow(n: isize) -> Result<()> {
     use core::cmp::Ordering;
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let data = p.data_mut();
     let mut sz = data.sz;
     let uvm = data.uvm.as_mut().unwrap();

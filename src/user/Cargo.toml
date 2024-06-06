@@ -78,6 +78,10 @@ path = "bin/sleep.rs"
 name = "_touch"
 path = "bin/touch.rs"
 
+[[bin]]
+name = "_clonetest"
+path = "bin/clonetest.rs"
+
 [dependencies]
 libkernel = { workspace = true }
 

@@ -554,6 +554,46 @@ impl Uvm {
         Ok(())
     }
 
+    // Maps the entries of old in the range provided in the new pagetable.
+    // Undos the changes if an error occurs.
+    // returns Result<()>
+    // TODO: Actually share physical pages
+    pub fn clone(&mut self, new: &mut Self, size: usize) -> Result<()> {
+        let mut va = UVAddr::from(0);
+        while va.into_usize() < size {
+            match self.walk(va, false) {
+                Some(pte) => {
+                    if !pte.is_v() {
+                        panic!("uvmclone: page not present");
+                    }
+                    let pa = pte.to_pa();
+                    let flags = pte.flags();
+                    let mem = if let Some(mem) = unsafe { Page::try_new_zeroed() } {
+                        mem
+                    } else {
+                        new.unmap(0.into(), va.into_usize() / PGSIZE, true);
+                        return Err(OutOfMemory);
+                    };
+                    unsafe {
+                        *mem = (*(pa.into_usize() as *mut Page)).clone();
+                    }
+                    if let Err(err) = new.mappages(va, (mem as usize).into(), PGSIZE, flags) {
+                        unsafe {
+                            let _pg = Box::from_raw(mem);
+                        }
+                        new.unmap(0.into(), va.into_usize() / PGSIZE, true);
+                        return Err(err);
+                    }
+                }
+                None => {
+                    panic!("uvmclone: pte should exist");
+                }
+            }
+            va += PGSIZE;
+        }
+        Ok(())
+    }
+
     // mark a PTE invalid for user access.
     // used by exec for the user stack guard page.
     pub fn clear(&mut self, va: UVAddr) {

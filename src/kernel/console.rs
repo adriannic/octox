@@ -50,7 +50,7 @@ impl Device for Mutex<Cons> {
     //
     fn read(&self, mut dst: VirtAddr, mut n: usize) -> Result<usize> {
         let mut cons_guard = self.lock();
-        let p = Cpus::myproc().unwrap();
+        let p = Cpus::mythread().unwrap();
 
         let target = n;
         while n > 0 {

@@ -54,7 +54,7 @@ impl Uvm {
 #[allow(clippy::redundant_closure_call)]
 #[no_mangle]
 pub fn exec(path: &Path, argv: [Option<String>; MAXARG]) -> Result<usize> {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
 
     let mut uvm: Option<Uvm> = None;
     let mut ustack = [0usize; MAXARG * 2]; // &str = [usize, usize]
@@ -126,7 +126,7 @@ pub fn exec(path: &Path, argv: [Option<String>; MAXARG]) -> Result<usize> {
 
     let exec = || -> Result<usize> {
         res?;
-        let p = Cpus::myproc().unwrap();
+        let p = Cpus::mythread().unwrap();
         let proc_data = p.data_mut();
 
         let tf = proc_data.trapframe.as_mut().unwrap();

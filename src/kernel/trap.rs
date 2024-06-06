@@ -54,7 +54,7 @@ pub extern "C" fn usertrap() -> ! {
         stvec::write(kernelvec as usize, stvec::TrapMode::Direct);
     }
 
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let data = unsafe { &mut (*p.data.get()) };
     let tf = data.trapframe.as_mut().unwrap();
 
@@ -118,7 +118,7 @@ pub extern "C" fn usertrap() -> ! {
 //
 #[no_mangle]
 pub unsafe extern "C" fn usertrap_ret() -> ! {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
 
     // we're about to switch the destination of traps from
     // kerneltrap() to usertrap(), so turn off interrupts until
@@ -196,7 +196,7 @@ pub extern "C" fn kerneltrap() {
 
     // give up the CPU if this is a timer interrupt.
     if Some(Intr::Timer) == which_dev {
-        if let Some(p) = Cpus::myproc() {
+        if let Some(p) = Cpus::mythread() {
             if p.inner.lock().state == ProcState::RUNNING {
                 proc::yielding()
             }
