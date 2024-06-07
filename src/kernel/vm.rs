@@ -1,5 +1,6 @@
 use crate::defs::AsBytes;
 use crate::error::{Error::*, Result};
+use crate::kalloc::KMEM;
 use crate::memlayout::{
     KERNBASE, PHYSTOP, PLIC, STACK_PAGE_NUM, TRAMPOLINE, TRAPFRAME, UART0, VIRTIO0,
 };
@@ -557,7 +558,6 @@ impl Uvm {
     // Maps the entries of old in the range provided in the new pagetable.
     // Undos the changes if an error occurs.
     // returns Result<()>
-    // TODO: Actually share physical pages
     pub fn clone(&mut self, new: &mut Self, size: usize) -> Result<()> {
         let mut va = UVAddr::from(0);
         while va.into_usize() < size {
@@ -568,15 +568,7 @@ impl Uvm {
                     }
                     let pa = pte.to_pa();
                     let flags = pte.flags();
-                    let mem = if let Some(mem) = unsafe { Page::try_new_zeroed() } {
-                        mem
-                    } else {
-                        new.unmap(0.into(), va.into_usize() / PGSIZE, true);
-                        return Err(OutOfMemory);
-                    };
-                    unsafe {
-                        *mem = (*(pa.into_usize() as *mut Page)).clone();
-                    }
+                    let mem = KMEM.clone_alloc(pa.into_usize()) as *mut Page;
                     if let Err(err) = new.mappages(va, (mem as usize).into(), PGSIZE, flags) {
                         unsafe {
                             let _pg = Box::from_raw(mem);

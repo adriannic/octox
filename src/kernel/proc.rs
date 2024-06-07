@@ -14,6 +14,7 @@ use crate::swtch::swtch;
 use crate::sync::{LazyLock, OnceLock};
 use crate::trampoline::trampoline;
 use crate::trap::usertrap_ret;
+use crate::vm::Page;
 use crate::vm::{Addr, KVAddr, PAddr, PageAllocator, UVAddr, Uvm, VirtAddr, KVM};
 use crate::{array, println};
 use alloc::string::String;
@@ -902,7 +903,7 @@ pub fn clone() -> Result<usize> {
     // Copy user memory from parent to child.
     let p_uvm = p_data.uvm.as_mut().unwrap();
     let c_uvm = c_data.uvm.as_mut().unwrap();
-    if let Err(err) = p_uvm.copy(c_uvm, p_data.sz) {
+    if let Err(err) = p_uvm.clone(c_uvm, p_data.sz) {
         c.free(c_guard);
         return Err(err);
     }
@@ -916,6 +917,39 @@ pub fn clone() -> Result<usize> {
 
     // Cause fork to return 0 in the child.
     c_tf.a0 = 0;
+
+    // Allocate a page for the child's stack
+    let mut sp = UVAddr::from(c_tf.sp);
+    sp.rounddown();
+    match c_uvm.walk(sp, false) {
+        Some(pte) => {
+            if !pte.is_v() {
+                panic!("clone: stack page not present");
+            }
+            let pa = pte.to_pa();
+            let flags = pte.flags();
+            let mem = if let Some(mem) = unsafe { Page::try_new_zeroed() } {
+                mem
+            } else {
+                c_uvm.unmap(0.into(), sp.into_usize() / PGSIZE, true);
+                return Err(OutOfMemory);
+            };
+            unsafe {
+                *mem = (*(pa.into_usize() as *mut Page)).clone();
+            }
+            c_uvm.unmap(sp, 1, true);
+            if let Err(err) = c_uvm.mappages(sp, (mem as usize).into(), PGSIZE, flags) {
+                unsafe {
+                    let _pg = Box::from_raw(mem);
+                }
+                c_uvm.unmap(0.into(), sp.into_usize() / PGSIZE, true);
+                return Err(err);
+            }
+        }
+        None => {
+            panic!("clone: stack pte should exist");
+        }
+    }
 
     // increment reference counts on open file descriptors.
     c_data.ofile.clone_from_slice(&p_data.ofile);
