@@ -54,6 +54,8 @@ pub enum SysCalls {
     Fcntl = 23,
     Clone = 24,
     Join = 25,
+    Nap = 26,
+    Rouse = 27,
     Invalid = 0,
 }
 
@@ -106,6 +108,8 @@ impl SysCalls {
         (Fn::I(Self::fcntl), "(fd: usize, cmd: FcntlCmd)"), //
         (Fn::I(Self::clone), "()"),                        //
         (Fn::I(Self::join), "(tid: usize, code: &mut i32)"), //
+        (Fn::U(Self::nap), "()"),                          //
+        (Fn::U(Self::rouse), "()"),                        //
     ];
     pub fn invalid() -> ! {
         unimplemented!()
@@ -377,6 +381,26 @@ impl SysCalls {
             let tid = argraw(0);
             let addr: UVAddr = argraw(1).into();
             join(tid, addr)
+        }
+    }
+
+    pub fn nap() -> Result<()> {
+        #[cfg(not(all(target_os = "none", feature = "kernel")))]
+        return Ok(());
+        #[cfg(all(target_os = "none", feature = "kernel"))]
+        {
+            nap();
+            Ok(())
+        }
+    }
+
+    pub fn rouse() -> Result<()> {
+        #[cfg(not(all(target_os = "none", feature = "kernel")))]
+        return Ok(());
+        #[cfg(all(target_os = "none", feature = "kernel"))]
+        {
+            rouse();
+            Ok(())
         }
     }
 }
@@ -680,6 +704,8 @@ impl SysCalls {
             23 => Self::Fcntl,
             24 => Self::Clone,
             25 => Self::Join,
+            26 => Self::Nap,
+            27 => Self::Rouse,
             _ => Self::Invalid,
         }
     }

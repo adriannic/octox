@@ -816,21 +816,44 @@ pub fn sleep<T>(chan: usize, mutex_guard: MutexGuard<'_, T>) -> MutexGuard<'_, T
     // so it's okay to release lock of mutex_guard.
     let mutex;
     {
-        let p = Cpus::mythread().unwrap();
-        let mut proc_lock = p.inner.lock();
+        let t = Cpus::mythread().unwrap();
+        let mut proc_lock = t.inner.lock();
         mutex = Mutex::unlock(mutex_guard);
 
         proc_lock.chan = chan;
         proc_lock.state = ProcState::SLEEPING;
 
         // to scheduler
-        proc_lock = sched(proc_lock, &mut p.data_mut().context);
+        proc_lock = sched(proc_lock, &mut t.data_mut().context);
 
         // tidy up
         proc_lock.chan = 0;
     }
     // Reacquires original lock.
     mutex.lock()
+}
+
+// Waits until a lock is released.
+// Must not hold proc_lock.
+pub fn nap() {
+    let t = Cpus::mythread().unwrap();
+    let p = Cpus::myproc();
+
+    let mut proc_lock = t.inner.lock();
+
+    proc_lock.chan = Arc::as_ptr(&p) as usize;
+    proc_lock.state = ProcState::SLEEPING;
+
+    // to scheduler
+    proc_lock = sched(proc_lock, &mut t.data_mut().context);
+
+    // tidy up
+    proc_lock.chan = 0;
+}
+
+pub fn rouse() {
+    let p = Cpus::myproc();
+    wakeup(Arc::as_ptr(&p) as usize);
 }
 
 // Wake up all processes sleeping on chan.
