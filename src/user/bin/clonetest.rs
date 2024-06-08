@@ -1,13 +1,5 @@
 #![no_std]
-use ulib::{print, println, sys};
-
-fn clone<T>(f: impl Fn(&[T]) -> i32, args: &[T]) -> usize {
-    match sys::clone() {
-        Err(_) => panic!("clone"),
-        Ok(0) => sys::exit(f(args)),
-        Ok(tid) => return tid,
-    }
-}
+use ulib::{print, println, sys, thread::Thread};
 
 fn thread_fn(args: &[i32]) -> i32 {
     let value = args[0];
@@ -21,9 +13,8 @@ fn thread_fn(args: &[i32]) -> i32 {
 
 fn main() {
     for expected_code in 1..=2 {
-        let tid = clone(thread_fn, &[expected_code]);
-        let mut code = 0;
-        sys::join(tid, &mut code);
+        let thread = Thread::new(thread_fn, &[expected_code]);
+        let code = thread.join().unwrap();
         println!("Thread exit code: {}", code);
         assert_eq!(code, expected_code);
     }
