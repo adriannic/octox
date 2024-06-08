@@ -1,15 +1,7 @@
-use core::fmt;
-
 use crate::sys::{clone, exit, join, Error};
 
 #[derive(Debug)]
 pub struct Thread(usize);
-
-impl fmt::Display for Thread {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 impl Drop for Thread {
     fn drop(&mut self) {
@@ -19,7 +11,7 @@ impl Drop for Thread {
 }
 
 impl Thread {
-    pub fn new<T>(f: impl Fn(&[T]) -> i32, args: &[T]) -> Self {
+    pub fn new<T>(f: impl Fn(T) -> i32, args: T) -> Self {
         match clone() {
             Err(_) => panic!("clone"),
             Ok(0) => exit(f(args)),
