@@ -52,6 +52,10 @@ pub enum SysCalls {
     Close = 21,
     Dup2 = 22,
     Fcntl = 23,
+    Clone = 24,
+    Join = 25,
+    Nap = 26,
+    Rouse = 27,
     Invalid = 0,
 }
 
@@ -102,6 +106,10 @@ impl SysCalls {
         (Fn::U(Self::close), "(fd: usize)"),               // Release open file fd.
         (Fn::I(Self::dup2), "(src: usize, dst: usize)"),   //
         (Fn::I(Self::fcntl), "(fd: usize, cmd: FcntlCmd)"), //
+        (Fn::I(Self::clone), "()"),                        //
+        (Fn::I(Self::join), "(tid: usize, code: &mut i32)"), //
+        (Fn::U(Self::nap), "()"),                          //
+        (Fn::U(Self::rouse), "()"),                        //
     ];
     pub fn invalid() -> ! {
         unimplemented!()
@@ -110,7 +118,7 @@ impl SysCalls {
 
 #[cfg(all(target_os = "none", feature = "kernel"))]
 pub fn syscall() {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let pdata = p.data_mut();
     let tf = pdata.trapframe.as_mut().unwrap();
     let syscall_id = SysCalls::from_usize(tf.a7);
@@ -142,7 +150,7 @@ unsafe impl AsBytes for SBInfo {}
 
 #[cfg(all(target_os = "none", feature = "kernel"))]
 fn fetch_addr<T: AsBytes>(addr: UVAddr, buf: &mut T) -> Result<()> {
-    let p_data = Cpus::myproc().unwrap().data();
+    let p_data = Cpus::mythread().unwrap().data();
     if addr.into_usize() >= p_data.sz || addr.into_usize() + size_of_val(buf) > p_data.sz {
         return Err(BadVirtAddr);
     }
@@ -169,7 +177,7 @@ fn fetch_slice<T: AsBytes>(slice_info: Slice, buf: &mut [T]) -> Result<usize> {
 
 #[cfg(all(target_os = "none", feature = "kernel"))]
 fn argraw(n: usize) -> usize {
-    let tf = Cpus::myproc().unwrap().data().trapframe.as_ref().unwrap();
+    let tf = Cpus::mythread().unwrap().data().trapframe.as_ref().unwrap();
     match n {
         0 => tf.a0,
         1 => tf.a1,
@@ -219,7 +227,7 @@ impl Arg for File {
     type In<'a> = usize;
     type Out<'a> = (&'a mut File, usize);
     fn from_arg<'a>(n: usize, input: &'a mut Self::In<'a>) -> Result<Self::Out<'a>> {
-        let p_data = Cpus::myproc().unwrap().data_mut();
+        let p_data = Cpus::mythread().unwrap().data_mut();
 
         *input = argraw(n);
         match p_data.ofile.get_mut(*input).ok_or(FileDescriptorTooLarge)? {
@@ -255,7 +263,7 @@ impl Arg for Argv {
 
 #[cfg(all(target_os = "none", feature = "kernel"))]
 fn fdalloc(file: File) -> Result<usize> {
-    for (fd, f) in Cpus::myproc()
+    for (fd, f) in Cpus::mythread()
         .unwrap()
         .data_mut()
         .ofile
@@ -286,7 +294,7 @@ impl SysCalls {
         return Ok(0);
         #[cfg(all(target_os = "none", feature = "kernel"))]
         {
-            Ok(Cpus::myproc().unwrap().pid())
+            Ok(Cpus::mythread().unwrap().pid())
         }
     }
     pub fn fork() -> Result<usize> {
@@ -311,7 +319,7 @@ impl SysCalls {
         return Ok(0);
         #[cfg(all(target_os = "none", feature = "kernel"))]
         {
-            let p = Cpus::myproc().unwrap();
+            let p = Cpus::mythread().unwrap();
             let n = argraw(0) as isize;
             let addr = p.data().sz;
             grow(n).and(Ok(addr))
@@ -322,7 +330,7 @@ impl SysCalls {
         return Ok(());
         #[cfg(all(target_os = "none", feature = "kernel"))]
         {
-            let p = Cpus::myproc().unwrap();
+            let p = Cpus::mythread().unwrap();
             let n = argraw(0);
             let mut ticks = TICKS.lock();
             let ticks0 = *ticks;
@@ -357,6 +365,44 @@ impl SysCalls {
             Ok(*TICKS.lock())
         }
     }
+    pub fn clone() -> Result<usize> {
+        #[cfg(not(all(target_os = "none", feature = "kernel")))]
+        return Ok(0);
+        #[cfg(all(target_os = "none", feature = "kernel"))]
+        {
+            clone()
+        }
+    }
+    pub fn join() -> Result<usize> {
+        #[cfg(not(all(target_os = "none", feature = "kernel")))]
+        return Ok(0);
+        #[cfg(all(target_os = "none", feature = "kernel"))]
+        {
+            let tid = argraw(0);
+            let addr: UVAddr = argraw(1).into();
+            join(tid, addr)
+        }
+    }
+
+    pub fn nap() -> Result<()> {
+        #[cfg(not(all(target_os = "none", feature = "kernel")))]
+        return Ok(());
+        #[cfg(all(target_os = "none", feature = "kernel"))]
+        {
+            nap();
+            Ok(())
+        }
+    }
+
+    pub fn rouse() -> Result<()> {
+        #[cfg(not(all(target_os = "none", feature = "kernel")))]
+        return Ok(());
+        #[cfg(all(target_os = "none", feature = "kernel"))]
+        {
+            rouse();
+            Ok(())
+        }
+    }
 }
 
 // System Calls related to File operations
@@ -377,7 +423,7 @@ impl SysCalls {
         #[cfg(all(target_os = "none", feature = "kernel"))]
         {
             // src , dst
-            let p = Cpus::myproc().unwrap().data_mut();
+            let p = Cpus::mythread().unwrap().data_mut();
             let src_fd = argraw(0);
             let dst_fd = argraw(1);
             if src_fd != dst_fd {
@@ -426,7 +472,9 @@ impl SysCalls {
         {
             let mut fd = 0;
             File::from_arg(0, &mut fd)?;
-            let _f = Cpus::myproc().unwrap().data_mut().ofile[fd].take().unwrap();
+            let _f = Cpus::mythread().unwrap().data_mut().ofile[fd]
+                .take()
+                .unwrap();
             drop(_f);
             Ok(())
         }
@@ -542,7 +590,7 @@ impl SysCalls {
         #[cfg(all(target_os = "none", feature = "kernel"))]
         {
             let mut path = [0u8; MAXPATH];
-            let data = Cpus::myproc().unwrap().data_mut();
+            let data = Cpus::mythread().unwrap().data_mut();
             let path = Path::from_arg(0, &mut path)?;
 
             let res;
@@ -597,7 +645,7 @@ impl SysCalls {
             let fd1 = match fdalloc(wf) {
                 Ok(fd) => fd,
                 Err(err) => {
-                    Cpus::myproc().unwrap().data_mut().ofile[fd0].take();
+                    Cpus::mythread().unwrap().data_mut().ofile[fd0].take();
                     return Err(err);
                 }
             };
@@ -605,7 +653,7 @@ impl SysCalls {
             if either_copyout(ptr.into(), &fd0).is_err()
                 || either_copyout((ptr + size_of::<usize>()).into(), &fd1).is_err()
             {
-                let p_data = Cpus::myproc().unwrap().data_mut();
+                let p_data = Cpus::mythread().unwrap().data_mut();
                 p_data.ofile[fd0].take();
                 p_data.ofile[fd1].take();
                 return Err(BadVirtAddr);
@@ -654,6 +702,10 @@ impl SysCalls {
             21 => Self::Close,
             22 => Self::Dup2,
             23 => Self::Fcntl,
+            24 => Self::Clone,
+            25 => Self::Join,
+            26 => Self::Nap,
+            27 => Self::Rouse,
             _ => Self::Invalid,
         }
     }

@@ -1,9 +1,10 @@
 use crate::defs::AsBytes;
 use crate::error::{Error::*, Result};
+use crate::kalloc::KMEM;
 use crate::memlayout::{
     KERNBASE, PHYSTOP, PLIC, STACK_PAGE_NUM, TRAMPOLINE, TRAPFRAME, UART0, VIRTIO0,
 };
-use crate::proc::PROCS;
+use crate::proc::TASKS;
 use crate::riscv::{pgroundup, pteflags::*, registers::satp, sfence_vma, PGSHIFT, PGSIZE};
 use crate::sync::OnceLock;
 use alloc::boxed::Box;
@@ -554,6 +555,37 @@ impl Uvm {
         Ok(())
     }
 
+    // Maps the entries of old in the range provided in the new pagetable.
+    // Undos the changes if an error occurs.
+    // returns Result<()>
+    pub fn clone(&mut self, new: &mut Self, size: usize) -> Result<()> {
+        let mut va = UVAddr::from(0);
+        while va.into_usize() < size {
+            match self.walk(va, false) {
+                Some(pte) => {
+                    if !pte.is_v() {
+                        panic!("uvmclone: page not present");
+                    }
+                    let pa = pte.to_pa();
+                    let flags = pte.flags();
+                    let mem = KMEM.clone_alloc(pa.into_usize()) as *mut Page;
+                    if let Err(err) = new.mappages(va, (mem as usize).into(), PGSIZE, flags) {
+                        unsafe {
+                            let _pg = Box::from_raw(mem);
+                        }
+                        new.unmap(0.into(), va.into_usize() / PGSIZE, true);
+                        return Err(err);
+                    }
+                }
+                None => {
+                    panic!("uvmclone: pte should exist");
+                }
+            }
+            va += PGSIZE;
+        }
+        Ok(())
+    }
+
     // mark a PTE invalid for user access.
     // used by exec for the user stack guard page.
     pub fn clear(&mut self, va: UVAddr) {
@@ -690,7 +722,7 @@ impl Kvm {
         );
 
         // map kernel stacks
-        PROCS.mapstacks();
+        TASKS.mapstacks();
     }
 }
 

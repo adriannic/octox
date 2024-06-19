@@ -27,6 +27,7 @@ pub mod mutex;
 pub mod path;
 pub mod pipe;
 pub mod process;
+pub mod thread;
 pub mod umalloc;
 //pub mod regex;
 

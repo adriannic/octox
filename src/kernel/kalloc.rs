@@ -22,6 +22,13 @@ fn on_oom(layout: Layout) -> ! {
 
 pub struct Kmem(Mutex<BuddyAllocator>);
 
+impl Kmem {
+    pub fn clone_alloc(&self, p: usize) -> usize {
+        self.0.lock().clone_alloc(p);
+        p
+    }
+}
+
 unsafe impl GlobalAlloc for Kmem {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.0

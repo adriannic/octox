@@ -14,6 +14,7 @@ use crate::swtch::swtch;
 use crate::sync::{LazyLock, OnceLock};
 use crate::trampoline::trampoline;
 use crate::trap::usertrap_ret;
+use crate::vm::Page;
 use crate::vm::{Addr, KVAddr, PAddr, PageAllocator, UVAddr, Uvm, VirtAddr, KVM};
 use crate::{array, println};
 use alloc::string::String;
@@ -27,8 +28,8 @@ use core::{cell::UnsafeCell, ops::Drop};
 pub static CPUS: Cpus = Cpus::new();
 
 #[allow(clippy::redundant_closure)]
-pub static PROCS: LazyLock<Procs> = LazyLock::new(|| Procs::new());
-pub static INITPROC: OnceLock<Arc<Proc>> = OnceLock::new();
+pub static TASKS: LazyLock<Tasks> = LazyLock::new(|| Tasks::new());
+pub static INITPROC: OnceLock<Arc<Task>> = OnceLock::new();
 
 pub struct Cpus([UnsafeCell<Cpu>; NCPU]);
 unsafe impl Sync for Cpus {}
@@ -36,7 +37,7 @@ unsafe impl Sync for Cpus {}
 // Per-CPU state
 #[derive(Debug)]
 pub struct Cpu {
-    pub proc: Option<Arc<Proc>>,  // The process running on this cpu, or None.
+    pub task: Option<Arc<Task>>,  // The process running on this cpu, or None.
     pub context: Context,         // swtch() here to enter scheduler().
     pub noff: isize,              // Depth of interrupts lock(lock_mycpu() depth).
     pub nest: [&'static str; 20], // manage nest for debugging.
@@ -69,13 +70,30 @@ impl Cpus {
     }
 
     // Return the current proc pointer: Some(Arc<Proc>), or None if none.
-    pub fn myproc() -> Option<Arc<Proc>> {
+    pub fn mythread() -> Option<Arc<Task>> {
         let _intr_lock = Self::lock_mycpu("withoutspin");
         let c;
         unsafe {
             c = &*CPUS.mycpu();
         }
-        c.proc.clone()
+        c.task.clone()
+    }
+
+    // Return the current process.
+    pub fn myproc() -> Arc<Task> {
+        let pid;
+        {
+            let t = Cpus::mythread().expect("Thread should exist");
+            let inner = t.inner.lock();
+            pid = inner.pid;
+        }
+        for p in TASKS.pool.iter() {
+            let inner = p.inner.lock();
+            if inner.tid == pid {
+                return Arc::clone(p);
+            }
+        }
+        panic!("Process not found");
     }
 
     // disable interrupts on mycpu().
@@ -91,7 +109,7 @@ impl Cpus {
 impl Cpu {
     const fn new() -> Self {
         Self {
-            proc: None,
+            task: None,
             context: Context::new(),
             noff: 0,
             nest: [
@@ -209,36 +227,37 @@ pub struct Trapframe {
 }
 
 #[derive(Debug)]
-pub struct Procs {
-    pub pool: [Arc<Proc>; NPROC],
-    parents: Mutex<[Option<Arc<Proc>>; NPROC]>,
+pub struct Tasks {
+    pub pool: [Arc<Task>; NPROC],
+    parents: Mutex<[Option<Arc<Task>>; NPROC]>,
 }
-unsafe impl Sync for Procs {}
+unsafe impl Sync for Tasks {}
 
 #[derive(Debug)]
-pub struct Proc {
+pub struct Task {
     // process table index.
     idx: usize,
     // lock must be held when using inner data:
-    pub inner: Mutex<ProcInner>,
+    pub inner: Mutex<TaskInner>,
     // these are private to the process, so lock need not be held.
-    pub data: UnsafeCell<ProcData>,
+    pub data: UnsafeCell<TaskData>,
 }
-unsafe impl Sync for Proc {}
+unsafe impl Sync for Task {}
 
 // lock must be held when uding these:
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ProcInner {
-    pub state: ProcState, // Process state
+pub struct TaskInner {
+    pub state: TaskState, // Process state
     pub chan: usize,      // if non-zero, sleeping on chan
     pub killed: bool,     // if true, have been killed
     pub xstate: i32,      // Exit status to be returned to parent's wait
-    pub pid: PId,         // Process ID
+    pub pid: Id,          // Process ID
+    pub tid: Id,          // Thread ID
 }
 
 // These are private to the process, so lock need not be held.
 #[derive(Debug)]
-pub struct ProcData {
+pub struct TaskData {
     pub kstack: KVAddr,                    // Virtual address of kernel stack
     pub sz: usize,                         // Size of process memory (bytes)
     pub uvm: Option<Uvm>,                  // User Memory Page Tabel
@@ -248,11 +267,11 @@ pub struct ProcData {
     pub ofile: [Option<File>; NOFILE],     // Open files
     pub cwd: Option<Inode>,                // Current directory
 }
-unsafe impl Sync for ProcData {}
-unsafe impl Send for ProcData {}
+unsafe impl Sync for TaskData {}
+unsafe impl Send for TaskData {}
 
 #[derive(PartialEq, Clone, Copy, Debug, Default)]
-pub enum ProcState {
+pub enum TaskState {
     #[default]
     UNUSED,
     USED,
@@ -263,12 +282,12 @@ pub enum ProcState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct PId(usize);
+pub struct Id(usize);
 
-impl PId {
+impl Id {
     fn alloc() -> Self {
         static NEXTID: AtomicUsize = AtomicUsize::new(0);
-        PId(NEXTID.fetch_add(1, Ordering::Relaxed))
+        Id(NEXTID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -309,18 +328,18 @@ impl Context {
     }
 }
 
-impl Default for Procs {
+impl Default for Tasks {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Procs {
+impl Tasks {
     pub fn new() -> Self {
         let mut i = 0;
         Self {
             pool: core::iter::repeat_with(|| {
-                let p = Arc::new(Proc::new(i));
+                let p = Arc::new(Task::new(i));
                 i += 1;
                 p
             })
@@ -356,13 +375,14 @@ impl Procs {
     // initialize state required to run in the kernel, and return
     // reference to the proc with "proc" lock held. If there are
     // no free procs, or a memory allocation fails, return None.
-    fn alloc(&self) -> Result<(&Arc<Proc>, MutexGuard<'_, ProcInner>)> {
+    fn alloc(&self) -> Result<(&Arc<Task>, MutexGuard<'_, TaskInner>)> {
         for p in self.pool.iter() {
             let mut lock = p.inner.lock();
             match lock.state {
-                ProcState::UNUSED => {
-                    lock.pid = PId::alloc();
-                    lock.state = ProcState::USED;
+                TaskState::UNUSED => {
+                    lock.pid = Id::alloc();
+                    lock.tid = lock.pid;
+                    lock.state = TaskState::USED;
 
                     let data = p.data_mut();
                     // Allocate a trapframe page.
@@ -400,44 +420,50 @@ impl Procs {
 
 // initialize the proc table at boottime.
 pub fn init() {
-    for (i, proc) in PROCS.pool.iter().enumerate() {
+    for (i, proc) in TASKS.pool.iter().enumerate() {
         proc.data_mut().kstack = kstack(i);
     }
 }
 
-impl Proc {
+impl Task {
     pub fn new(idx: usize) -> Self {
         Self {
             idx,
-            inner: Mutex::new(ProcInner::new(), "proc"),
-            data: UnsafeCell::new(ProcData::new()),
+            inner: Mutex::new(TaskInner::new(), "proc"),
+            data: UnsafeCell::new(TaskData::new()),
         }
     }
     pub fn pid(&self) -> usize {
         self.inner.lock().pid.0
     }
 
-    pub fn data(&self) -> &'static ProcData {
+    pub fn is_proc(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.pid == inner.tid
+    }
+
+    pub fn data(&self) -> &'static TaskData {
         unsafe { &*(self.data.get()) }
     }
 
-    pub fn data_mut(&self) -> &'static mut ProcData {
+    pub fn data_mut(&self) -> &'static mut TaskData {
         unsafe { &mut *(self.data.get()) }
     }
 
-    fn free(&self, mut guard: MutexGuard<'_, ProcInner>) {
+    fn free(&self, mut guard: MutexGuard<'_, TaskInner>) {
         let data = self.data_mut();
         data.trapframe.take();
         if let Some(uvm) = data.uvm.take() {
             uvm.proc_uvmfree(data.sz);
         }
         data.sz = 0;
-        guard.pid = PId(0);
+        guard.pid = Id(0);
+        guard.tid = Id(0);
         data.name.clear();
         guard.chan = 0;
         guard.killed = false;
         guard.xstate = 0;
-        guard.state = ProcState::UNUSED;
+        guard.state = TaskState::UNUSED;
     }
 
     // Create a user page table with no user memory
@@ -481,7 +507,7 @@ impl Proc {
 pub fn either_copyout<T: ?Sized + AsBytes>(dst: VirtAddr, src: &T) -> Result<()> {
     match dst {
         VirtAddr::User(addr) => {
-            let p = Cpus::myproc().unwrap();
+            let p = Cpus::mythread().unwrap();
             let uvm = p.data_mut().uvm.as_mut().unwrap();
             uvm.copyout(addr.into(), src)
         }
@@ -499,7 +525,7 @@ pub fn either_copyout<T: ?Sized + AsBytes>(dst: VirtAddr, src: &T) -> Result<()>
 pub fn either_copyin<T: ?Sized + AsBytes>(dst: &mut T, src: VirtAddr) -> Result<()> {
     match src {
         VirtAddr::User(addr) => {
-            let p = Cpus::myproc().unwrap();
+            let p = Cpus::mythread().unwrap();
             let uvm = p.data_mut().uvm.as_mut().unwrap();
             uvm.copyin(dst, addr.into())
         }
@@ -515,7 +541,7 @@ pub fn either_copyin<T: ?Sized + AsBytes>(dst: &mut T, src: VirtAddr) -> Result<
 
 // Set up first user process.
 pub fn user_init(initcode: &'static [u8]) {
-    let (p, ref mut guard) = PROCS.alloc().unwrap();
+    let (p, ref mut guard) = TASKS.alloc().unwrap();
     INITPROC.set(p.clone()).unwrap();
 
     let data = p.data_mut();
@@ -578,22 +604,23 @@ pub fn user_init(initcode: &'static [u8]) {
     tf.sp = UVAddr::from(sz).into_usize(); // user stack pointer
 
     data.name.push_str("initcode");
-    guard.state = ProcState::RUNNABLE;
+    guard.state = TaskState::RUNNABLE;
 }
 
-impl ProcInner {
+impl TaskInner {
     pub const fn new() -> Self {
         Self {
-            state: ProcState::UNUSED,
+            state: TaskState::UNUSED,
             chan: 0,
             killed: false,
             xstate: 0,
-            pid: PId(0),
+            pid: Id(0),
+            tid: Id(0),
         }
     }
 }
 
-impl ProcData {
+impl TaskData {
     pub fn new() -> Self {
         Self {
             kstack: KVAddr::from(0),
@@ -608,7 +635,7 @@ impl ProcData {
     }
 }
 
-impl Default for ProcData {
+impl Default for TaskData {
     fn default() -> Self {
         Self::new()
     }
@@ -621,7 +648,7 @@ pub unsafe extern "C" fn fork_ret() -> ! {
 
     // still holding "proc" lock from scheduler.
     // force_unlock() from my_proc() is needed because the stack is different
-    Cpus::myproc().unwrap().inner.force_unlock();
+    Cpus::mythread().unwrap().inner.force_unlock();
 
     if FIRST {
         // File system initialization must be run in the context of a
@@ -640,13 +667,13 @@ pub unsafe extern "C" fn fork_ret() -> ! {
 // No lock to avoid wedging a stuck machine further.
 pub fn dump() {
     println!("");
-    for proc in PROCS.pool.iter() {
+    for proc in TASKS.pool.iter() {
         let inner = unsafe { proc.inner.get_mut() };
         let data = unsafe { &(*proc.data.get()) };
-        if inner.state != ProcState::UNUSED {
+        if inner.state != TaskState::UNUSED {
             println!(
-                "pid: {:?} state: {:?} name: {:?}, chan: {}",
-                inner.pid, inner.state, data.name, inner.chan
+                "tid: {:?} state: {:?} name: {:?}, chan: {}",
+                inner.tid, inner.state, data.name, inner.chan
             );
         }
     }
@@ -666,19 +693,19 @@ pub fn scheduler() -> ! {
         // Avoid deadlock by ensuring thet devices can interrupt.
         intr_on();
 
-        for p in PROCS.pool.iter() {
+        for p in TASKS.pool.iter() {
             let mut inner = p.inner.lock();
-            if inner.state == ProcState::RUNNABLE {
+            if inner.state == TaskState::RUNNABLE {
                 // Switch to chosen process. It is the process's job
                 // to release its lock and then reacquire it
                 // before jumping back to us.
-                inner.state = ProcState::RUNNING;
+                inner.state = TaskState::RUNNING;
                 unsafe {
-                    (*c).proc.replace(Arc::clone(p));
+                    (*c).task.replace(Arc::clone(p));
                     swtch(&mut (*c).context, &p.data().context);
                     // Process is done running for now.
                     // It should have changed its p->state before coming back.
-                    (*c).proc.take();
+                    (*c).task.take();
                 }
             }
         }
@@ -689,7 +716,7 @@ pub fn scheduler() -> ! {
 // and have changed proc.state. Saves and restores
 // intena because intena is a property of this
 // kernel thread, not this CPU.
-fn sched<'a>(guard: MutexGuard<'a, ProcInner>, ctx: &mut Context) -> MutexGuard<'a, ProcInner> {
+fn sched<'a>(guard: MutexGuard<'a, TaskInner>, ctx: &mut Context) -> MutexGuard<'a, TaskInner> {
     unsafe {
         let c = &mut *CPUS.mycpu();
         assert!(guard.holding(), "sched proc lock");
@@ -697,12 +724,12 @@ fn sched<'a>(guard: MutexGuard<'a, ProcInner>, ctx: &mut Context) -> MutexGuard<
             c.noff == 1,
             "sched multiple locks {}, {:#?}, {:?}, {:?}, {:?}",
             c.noff,
-            *PROCS,
+            *TASKS,
             c.nest,
             guard,
             BCACHE
         );
-        assert!(guard.state != ProcState::RUNNING, "shced running");
+        assert!(guard.state != TaskState::RUNNING, "shced running");
         assert!(!intr_get(), "sched interruptible");
 
         let intena = c.intena;
@@ -716,18 +743,19 @@ fn sched<'a>(guard: MutexGuard<'a, ProcInner>, ctx: &mut Context) -> MutexGuard<
 
 // Give up the CPU for one scheduling round.
 pub fn yielding() {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let mut guard = p.inner.lock();
-    guard.state = ProcState::RUNNABLE;
+    guard.state = TaskState::RUNNABLE;
     sched(guard, &mut p.data_mut().context);
 }
 
 pub fn exit(status: i32) -> ! {
-    let p = Cpus::myproc().unwrap();
-    assert!(!Arc::ptr_eq(&p, INITPROC.get().unwrap()), "init exiting");
+    let t = Cpus::mythread().unwrap();
+    let pid = t.inner.lock().pid;
+    assert!(!Arc::ptr_eq(&t, INITPROC.get().unwrap()), "init exiting");
 
     // Close all open files
-    let data = p.data_mut();
+    let data = t.data_mut();
     for fd in data.ofile.iter_mut() {
         let _file = fd.take();
     }
@@ -738,13 +766,25 @@ pub fn exit(status: i32) -> ! {
     }
     LOG.end_op();
 
+    if t.is_proc() {
+        for thread in TASKS.pool.iter() {
+            let mut inner = thread.inner.lock();
+            if inner.pid == pid && inner.tid != pid {
+                inner.killed = true;
+                if inner.state == TaskState::SLEEPING {
+                    inner.state = TaskState::RUNNABLE;
+                }
+            }
+        }
+    }
+
     let mut proc_guard;
     {
-        let mut parents = PROCS.parents.lock();
+        let mut parents = TASKS.parents.lock();
         // Pass p's abandoned children to init.
         for opp in parents.iter_mut().filter(|pp| pp.is_some()) {
             match opp {
-                Some(ref pp) if Arc::ptr_eq(pp, &p) => {
+                Some(ref pp) if Arc::ptr_eq(pp, &t) => {
                     let initproc = INITPROC.get().unwrap();
                     opp.replace(Arc::clone(initproc));
                     self::wakeup(Arc::as_ptr(initproc) as usize);
@@ -753,10 +793,10 @@ pub fn exit(status: i32) -> ! {
             }
         }
         // Parent might be sleeping in wait().
-        self::wakeup(Arc::as_ptr(parents[p.idx].as_ref().unwrap()) as usize);
-        proc_guard = p.inner.lock();
+        self::wakeup(Arc::as_ptr(parents[t.idx].as_ref().unwrap()) as usize);
+        proc_guard = t.inner.lock();
         proc_guard.xstate = status;
-        proc_guard.state = ProcState::ZOMBIE;
+        proc_guard.state = TaskState::ZOMBIE;
     }
 
     // jump into scheduler, never to return.
@@ -776,15 +816,15 @@ pub fn sleep<T>(chan: usize, mutex_guard: MutexGuard<'_, T>) -> MutexGuard<'_, T
     // so it's okay to release lock of mutex_guard.
     let mutex;
     {
-        let p = Cpus::myproc().unwrap();
-        let mut proc_lock = p.inner.lock();
+        let t = Cpus::mythread().unwrap();
+        let mut proc_lock = t.inner.lock();
         mutex = Mutex::unlock(mutex_guard);
 
         proc_lock.chan = chan;
-        proc_lock.state = ProcState::SLEEPING;
+        proc_lock.state = TaskState::SLEEPING;
 
         // to scheduler
-        proc_lock = sched(proc_lock, &mut p.data_mut().context);
+        proc_lock = sched(proc_lock, &mut t.data_mut().context);
 
         // tidy up
         proc_lock.chan = 0;
@@ -793,16 +833,39 @@ pub fn sleep<T>(chan: usize, mutex_guard: MutexGuard<'_, T>) -> MutexGuard<'_, T
     mutex.lock()
 }
 
+// Waits until a lock is released.
+// Must not hold proc_lock.
+pub fn nap() {
+    let t = Cpus::mythread().unwrap();
+    let p = Cpus::myproc();
+
+    let mut proc_lock = t.inner.lock();
+
+    proc_lock.chan = Arc::as_ptr(&p) as usize;
+    proc_lock.state = TaskState::SLEEPING;
+
+    // to scheduler
+    proc_lock = sched(proc_lock, &mut t.data_mut().context);
+
+    // tidy up
+    proc_lock.chan = 0;
+}
+
+pub fn rouse() {
+    let p = Cpus::myproc();
+    wakeup(Arc::as_ptr(&p) as usize);
+}
+
 // Wake up all processes sleeping on chan.
 // Must be called without any "proc" lock.
 pub fn wakeup(chan: usize) {
-    for p in PROCS.pool.iter() {
-        match Cpus::myproc() {
+    for p in TASKS.pool.iter() {
+        match Cpus::mythread() {
             Some(ref cp) if Arc::ptr_eq(p, cp) => (),
             _ => {
                 let mut guard = p.inner.lock();
-                if guard.state == ProcState::SLEEPING && guard.chan == chan {
-                    guard.state = ProcState::RUNNABLE;
+                if guard.state == TaskState::SLEEPING && guard.chan == chan {
+                    guard.state = TaskState::RUNNABLE;
                 }
             }
         }
@@ -812,9 +875,9 @@ pub fn wakeup(chan: usize) {
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 pub fn fork() -> Result<usize> {
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let p_data = p.data_mut();
-    let (c, c_guard) = PROCS.alloc()?;
+    let (c, c_guard) = TASKS.alloc()?;
     let c_data = c.data_mut();
 
     // Copy user memory from parent to child.
@@ -844,30 +907,155 @@ pub fn fork() -> Result<usize> {
 
     let c_inner = Mutex::unlock(c_guard);
     {
-        let mut parents = PROCS.parents.lock();
+        let mut parents = TASKS.parents.lock();
         parents[c.idx] = Some(Arc::clone(&p));
     }
-    c_inner.lock().state = ProcState::RUNNABLE;
+    c_inner.lock().state = TaskState::RUNNABLE;
 
     Ok(pid.0)
+}
+
+// Create a new thread, copying the parent.
+// Child starts execution by calling the function passed.
+pub fn clone() -> Result<usize> {
+    let p = Cpus::mythread().unwrap();
+    let p_data = p.data_mut();
+    let (c, mut c_guard) = TASKS.alloc()?;
+    let c_data = c.data_mut();
+
+    // Copy user memory from parent to child.
+    let p_uvm = p_data.uvm.as_mut().unwrap();
+    let c_uvm = c_data.uvm.as_mut().unwrap();
+    if let Err(err) = p_uvm.clone(c_uvm, p_data.sz) {
+        c.free(c_guard);
+        return Err(err);
+    }
+    c_data.sz = p_data.sz;
+    c_guard.pid = p.inner.lock().pid;
+
+    // copy saved user registers
+    let p_tf = p_data.trapframe.as_ref().unwrap();
+    let c_tf = c_data.trapframe.as_mut().unwrap();
+    c_tf.clone_from(p_tf);
+
+    // Cause fork to return 0 in the child.
+    c_tf.a0 = 0;
+
+    // Allocate a page for the child's stack
+    let mut sp = UVAddr::from(c_tf.sp);
+    sp.rounddown();
+    match c_uvm.walk(sp, false) {
+        Some(pte) => {
+            if !pte.is_v() {
+                panic!("clone: stack page not present");
+            }
+            let pa = pte.to_pa();
+            let flags = pte.flags();
+            let mem = if let Some(mem) = unsafe { Page::try_new_zeroed() } {
+                mem
+            } else {
+                c_uvm.unmap(0.into(), sp.into_usize() / PGSIZE, true);
+                return Err(OutOfMemory);
+            };
+            unsafe {
+                *mem = (*(pa.into_usize() as *mut Page)).clone();
+            }
+            c_uvm.unmap(sp, 1, true);
+            if let Err(err) = c_uvm.mappages(sp, (mem as usize).into(), PGSIZE, flags) {
+                unsafe {
+                    let _pg = Box::from_raw(mem);
+                }
+                c_uvm.unmap(0.into(), sp.into_usize() / PGSIZE, true);
+                return Err(err);
+            }
+        }
+        None => {
+            panic!("clone: stack pte should exist");
+        }
+    }
+
+    // increment reference counts on open file descriptors.
+    c_data.ofile.clone_from_slice(&p_data.ofile);
+    c_data.cwd = p_data.cwd.clone();
+
+    c_data.name.push_str(&p_data.name);
+
+    let tid = c_guard.tid;
+
+    let c_inner = Mutex::unlock(c_guard);
+    {
+        let mut parents = TASKS.parents.lock();
+        parents[c.idx] = Some(Arc::clone(&p));
+    }
+    c_inner.lock().state = TaskState::RUNNABLE;
+
+    Ok(tid.0)
+}
+
+// Wait for a child thread to exit and return its tid.
+// Return Err, if this process has no children.
+pub fn join(tid: usize, addr: UVAddr) -> Result<usize> {
+    let mut threadfound;
+    let t = Cpus::mythread().unwrap();
+    let tid = Id(tid);
+
+    let mut parents = TASKS.parents.lock();
+
+    loop {
+        // Scan through table looking for exited children.
+        threadfound = false;
+        for c in TASKS.pool.iter() {
+            let c_guard = c.inner.lock();
+            match parents[c.idx] {
+                Some(_) if c_guard.tid == tid => {
+                    // make sure the child isn't still in exit() or swtch().
+                    threadfound = true;
+                    if c_guard.state == TaskState::ZOMBIE {
+                        // Found one.
+                        t.data_mut()
+                            .uvm
+                            .as_mut()
+                            .unwrap()
+                            .copyout(addr, &c_guard.xstate)?;
+                        c.free(c_guard);
+                        parents[c.idx].take();
+                        return Ok(tid.0);
+                    }
+                }
+                _ => continue,
+            }
+        }
+        // No point waiting if we don't have any children.
+        if !threadfound || t.inner.lock().killed {
+            break Err(NoChildProcesses);
+        }
+
+        // wait for a child to exit
+        parents = sleep(Arc::as_ptr(&t) as usize, parents);
+    }
 }
 
 // Kill the process with the given pid.
 // The victim won't exit until it tries to return
 // to user space (see usertrap in trap.rs)
 pub fn kill(pid: usize) -> Result<()> {
-    for p in PROCS.pool.iter() {
+    let mut killed = false;
+    for p in TASKS.pool.iter() {
         let mut guard = p.inner.lock();
         if guard.pid.0 == pid {
             guard.killed = true;
-            if guard.state == ProcState::SLEEPING {
+            if guard.state == TaskState::SLEEPING {
                 // Wake process from sleep().
-                guard.state = ProcState::RUNNABLE;
+                guard.state = TaskState::RUNNABLE;
             }
-            return Ok(());
+            killed = true;
         }
     }
-    Err(NoSuchProcess)
+    if killed {
+        Ok(())
+    } else {
+        Err(NoSuchProcess)
+    }
 }
 
 // Wait for a child process to exit and return its pid.
@@ -875,20 +1063,20 @@ pub fn kill(pid: usize) -> Result<()> {
 pub fn wait(addr: UVAddr) -> Result<usize> {
     let pid;
     let mut havekids;
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::myproc();
 
-    let mut parents = PROCS.parents.lock();
+    let mut parents = TASKS.parents.lock();
 
     loop {
         // Scan through table looking for exited children.
         havekids = false;
-        for c in PROCS.pool.iter() {
+        for c in TASKS.pool.iter() {
             match parents[c.idx] {
-                Some(ref pp) if Arc::ptr_eq(pp, &p) => {
+                Some(ref pp) if Arc::ptr_eq(pp, &p) && c.is_proc() => {
                     // macke sure the child isn't still in exit() or swtch().
                     let c_guard = c.inner.lock();
                     havekids = true;
-                    if c_guard.state == ProcState::ZOMBIE {
+                    if c_guard.state == TaskState::ZOMBIE {
                         // Found one.
                         pid = c_guard.pid.0;
                         p.data_mut()
@@ -916,7 +1104,7 @@ pub fn wait(addr: UVAddr) -> Result<usize> {
 
 pub fn grow(n: isize) -> Result<()> {
     use core::cmp::Ordering;
-    let p = Cpus::myproc().unwrap();
+    let p = Cpus::mythread().unwrap();
     let data = p.data_mut();
     let mut sz = data.sz;
     let uvm = data.uvm.as_mut().unwrap();

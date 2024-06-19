@@ -989,7 +989,7 @@ impl Path {
     pub fn namex(path: &Path, parent: bool) -> Result<(&str, Inode)> {
         let mut ip = match path.inner.get(0..1) {
             Some("/") => ITABLE.get(ROOTDEV, ROOTINO)?,
-            _ => Cpus::myproc().unwrap().data().cwd.as_ref().unwrap().dup(),
+            _ => Cpus::mythread().unwrap().data().cwd.as_ref().unwrap().dup(),
         };
 
         let mut path = path;

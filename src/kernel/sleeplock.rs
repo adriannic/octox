@@ -47,7 +47,7 @@ impl<T> SleepLock<T> {
 
     pub fn lock(&self) -> SleepLockGuard<'_, T> {
         let mut lk = self.lk.lock();
-        let p = Cpus::myproc().unwrap();
+        let p = Cpus::mythread().unwrap();
         while lk.locked {
             lk = sleep(self as *const _ as usize, lk);
         }
@@ -58,7 +58,7 @@ impl<T> SleepLock<T> {
 
     pub fn holding(&self) -> bool {
         let lk = self.lk.lock();
-        lk.locked && lk.pid == Cpus::myproc().unwrap().pid()
+        lk.locked && lk.pid == Cpus::mythread().unwrap().pid()
     }
 
     pub fn unlock(guard: SleepLockGuard<'_, T>) -> &'_ SleepLock<T> {

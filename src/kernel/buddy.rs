@@ -3,6 +3,7 @@
 use crate::list::List;
 use core::alloc::Layout;
 use core::cmp;
+use core::cmp::Ordering;
 use core::ptr::{self, NonNull};
 
 const fn round_up(n: usize, sz: usize) -> usize {
@@ -15,10 +16,11 @@ const fn round_down(n: usize, sz: usize) -> usize {
 type BdList = List;
 
 pub struct BuddyAllocator {
-    initialized: bool, // initialization flag
-    base: usize,       // memory start address
-    end: usize,        // memory end address
-    nsize: usize,      // number of entries in self.sizes array
+    initialized: bool,           // initialization flag
+    base: usize,                 // memory start address
+    end: usize,                  // memory end address
+    nsize: usize,                // number of entries in self.sizes array
+    refs: Option<NonNull<[u8]>>, // number of references
     sizes: Option<NonNull<[SzInfo]>>,
 }
 unsafe impl Send for BuddyAllocator {}
@@ -124,6 +126,7 @@ impl BuddyAllocator {
             base: 0,
             end: 0,
             nsize: 0,
+            refs: None,
             sizes: None,
         }
     }
@@ -171,6 +174,12 @@ impl BuddyAllocator {
                 }
                 k -= 1;
             }
+
+            // Initialize a ref counter for the allocation
+            let refs = unsafe { self.refs.unwrap().as_mut() };
+            let elem = &mut refs[self.blk_index(0, p)];
+            *elem = 1;
+
             NonNull::new(p as *mut u8)
         } else {
             None
@@ -196,6 +205,20 @@ impl BuddyAllocator {
     // alloc
     pub fn dealloc(&mut self, p: *mut u8, _layout: Layout) {
         let mut p = p as usize;
+        let refs = unsafe { self.refs.unwrap().as_mut() };
+        let counter = &mut refs[self.blk_index(0, p)];
+
+        match 1.cmp(counter) {
+            Ordering::Greater => {
+                panic!("bd: tried to free an unallocated block");
+            }
+            Ordering::Less => {
+                *counter -= 1;
+                return;
+            }
+            _ => {}
+        }
+
         let mut fk = self.size(p);
         let mut q;
         if let Some(mut sizes_ptr) = self.sizes {
@@ -223,6 +246,8 @@ impl BuddyAllocator {
                 sizes[fk].free.push(p);
             }
         }
+        // Free ref counter
+        *counter = 0;
     }
 
     // Mark memory from [start, stop), starting at size 0, as allocated.
@@ -335,6 +360,9 @@ impl BuddyAllocator {
             self.end - p,
             self.nsize
         );
+        //
+        // allocate self.refs array
+        self.refs.replace(init_nonnull_slice(&mut p, self.nblk(0)));
 
         // allocate self.sizes array
         self.sizes.replace(init_nonnull_slice(&mut p, self.nsize));
@@ -375,6 +403,17 @@ impl BuddyAllocator {
 
         self.initialized = true;
         Ok(())
+    }
+
+    pub fn clone_alloc(&mut self, p: usize) {
+        let refs = unsafe { self.refs.unwrap().as_mut() };
+        let counter = &mut refs[self.blk_index(0, p)];
+        if *counter == 0 {
+            panic!("bd: Can't clone unallocated block");
+        }
+        *counter = 1u8
+            .checked_add(*counter)
+            .expect("Max number of refs to a single allocation reached (255)");
     }
 }
 

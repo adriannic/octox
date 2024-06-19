@@ -7,6 +7,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use crate::sys;
+
 #[derive(Debug)]
 pub struct Mutex<T> {
     locked: AtomicBool,
@@ -24,7 +26,7 @@ impl<T> Mutex<T> {
     }
     pub fn lock(&self) -> MutexGuard<T> {
         while self.locked.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
+            sys::nap();
         }
         MutexGuard { lock: self }
     }
@@ -57,6 +59,7 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release)
+        self.lock.locked.store(false, Ordering::Release);
+        sys::rouse();
     }
 }
