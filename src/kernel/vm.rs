@@ -4,7 +4,7 @@ use crate::kalloc::KMEM;
 use crate::memlayout::{
     KERNBASE, PHYSTOP, PLIC, STACK_PAGE_NUM, TRAMPOLINE, TRAPFRAME, UART0, VIRTIO0,
 };
-use crate::proc::PROCS;
+use crate::proc::TASKS;
 use crate::riscv::{pgroundup, pteflags::*, registers::satp, sfence_vma, PGSHIFT, PGSIZE};
 use crate::sync::OnceLock;
 use alloc::boxed::Box;
@@ -722,7 +722,7 @@ impl Kvm {
         );
 
         // map kernel stacks
-        PROCS.mapstacks();
+        TASKS.mapstacks();
     }
 }
 

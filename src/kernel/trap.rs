@@ -2,7 +2,7 @@ use crate::{
     kernelvec::kernelvec,
     memlayout::{STACK_PAGE_NUM, TRAMPOLINE, UART0_IRQ, VIRTIO0_IRQ},
     plic,
-    proc::{self, Cpus, ProcState},
+    proc::{self, Cpus, TaskState},
     riscv::{
         registers::{scause::*, *},
         *,
@@ -197,7 +197,7 @@ pub extern "C" fn kerneltrap() {
     // give up the CPU if this is a timer interrupt.
     if Some(Intr::Timer) == which_dev {
         if let Some(p) = Cpus::mythread() {
-            if p.inner.lock().state == ProcState::RUNNING {
+            if p.inner.lock().state == TaskState::RUNNING {
                 proc::yielding()
             }
         }
